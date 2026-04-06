@@ -6,30 +6,46 @@ The contributor reward system (`distributeContributorRewards`) exists in the web
 
 ## Intended Behavior
 
-When a user runs a generation that uses LoRA models trained by other users (and/or a spell authored by another user), an additional surcharge of up to 20% of the base generation cost is charged to the user and distributed to contributors:
+When a user runs a generation that uses LoRA models trained by other users (and/or a spell authored by another user), an additional surcharge of up to 20% of the base generation cost is charged to the user and distributed to contributors. The surcharge is split into two separate pools:
 
-- **Spell author**: 1 share from the pool (if the generation is a spell and the author is not the generating user)
-- **LoRA model trainers**: 1 share per LoRA used (if the LoRA owner is not the generating user)
-- **Per-model cap**: Each LoRA contributes at most 5% of base cost
-- **Hard cap**: Total contributor surcharge cannot exceed 20% of base cost
-- **Pool division**: The capped pool is divided proportionally by share count
+### Spell Author Reward (fixed 5%)
+- **Spell author** receives a flat **5%** of base cost (if the generation is a spell and the author is not the generating user)
+- This is not shared or diluted — it is a fixed allocation
+
+### LoRA Model Trainer Reward (up to 15%, capped)
+- Each external LoRA used contributes **5%** of base cost to the LoRA reward pool
+- The LoRA pool is **capped at 15%** of base cost (i.e., 3+ LoRAs hit the cap)
+- The capped pool is divided proportionally by share count among LoRA authors
+
+### Hard Cap
+- Total contributor surcharge (spell + LoRA) cannot exceed **20%** of base cost
 
 ### Example Scenarios
 
 **Scenario A** — 1 spell + 1 LoRA (different authors):
-- Pool = 20% of base, 2 shares → each gets 10%
+- Spell author: 5%, LoRA author: 5% → total surcharge: 10%
 
 **Scenario B** — 1 spell + 4 LoRAs (all different authors):
-- 4 LoRAs × 5% = 20%, already at cap → pool = 20%, 5 shares → each gets 4%
+- Spell author: 5%, LoRA pool: 4 × 5% = 20% capped to 15%, 4 shares → each gets 3.75%
+- Total surcharge: 20%
 
 **Scenario C** — No spell, 2 LoRAs (same author):
-- 2 shares × 5% = 10% → pool = 10%, 1 author with 2 shares → author gets 10%
+- LoRA pool: 2 × 5% = 10%, 1 author with 2 shares → author gets 10%
+- Total surcharge: 10%
 
 **Scenario D** — No spell, 6 LoRAs (6 different authors):
-- 6 × 5% = 30%, capped to 20% → pool = 20%, 6 shares → each gets ~3.3%
+- LoRA pool: 6 × 5% = 30% capped to 15%, 6 shares → each gets 2.5%
+- Total surcharge: 15%
 
 **Scenario E** — User uses their own LoRA + 1 external LoRA:
-- Own LoRA excluded → 1 share × 5% = 5% → pool = 5%, 1 author gets 5%
+- Own LoRA excluded → 1 share × 5% = 5%, 1 author gets 5%
+- Total surcharge: 5%
+
+**Scenario F** — 1 spell + 3 LoRAs (spell author also owns 1 LoRA):
+- Spell author: 5%
+- LoRA pool: 3 shares but 1 is user's own → 2 external shares × 5% = 10%
+- 2 shares → spell author gets 5% (LoRA) + 5% (spell) = 10%, other author gets 5%
+- Total surcharge: 15%
 
 ## Root Cause Analysis
 
@@ -136,24 +152,53 @@ This covers both paths:
 - **Direct generation**: uses `loraResolutionData` captured in Change 2
 - **Spell execution**: uses `metadata.loraResolutionData` passed from StepExecutor → ImmediateStrategy
 
-### Change 4: Apply per-model cap and hard cap in reward distribution
+### Change 4: Split reward distribution into spell + LoRA pools with caps
 
 **File:** `src/core/services/comfydeploy/webhookProcessor.js`
 
-**At lines 562-575**, replace the current flat 20% pool calculation with capped logic:
+Replace the current single-pool logic (lines 520-630) with two separate pools:
 
 ```js
-// --- 2. Calculate rewards with per-model cap and hard cap ---
-const PER_LORA_RATE = 0.05;   // 5% per LoRA
-const HARD_CAP_RATE = 0.20;   // 20% total max
+const SPELL_REWARD_RATE = 0.05;    // Spell author gets flat 5%
+const PER_LORA_RATE = 0.05;        // 5% per external LoRA
+const LORA_POOL_CAP_RATE = 0.15;   // LoRA pool capped at 15%
 
-// Calculate uncapped pool: 5% per share
-const uncappedPool = Math.floor(basePoints * PER_LORA_RATE * totalShares);
-// Apply hard cap
-const contributorRewardPool = Math.min(uncappedPool, Math.floor(basePoints * HARD_CAP_RATE));
+// --- Spell reward (fixed, not shared) ---
+let spellRewardPoints = 0;
+if (isSpell && spellOwnerId && spellOwnerId !== generatingUserId) {
+  spellRewardPoints = Math.floor(basePoints * SPELL_REWARD_RATE);
+}
+
+// --- LoRA reward pool (capped, shared proportionally) ---
+// Count only external LoRA shares (exclude user's own)
+const loraShares = {}; // { ownerId: shareCount }
+let totalLoraShares = 0;
+loras.forEach(lora => {
+  const ownerId = lora.ownerAccountId?.toString();
+  if (ownerId && ownerId !== generatingUserId) {
+    loraShares[ownerId] = (loraShares[ownerId] || 0) + 1;
+    totalLoraShares++;
+  }
+});
+
+const uncappedLoraPool = Math.floor(basePoints * PER_LORA_RATE * totalLoraShares);
+const loraRewardPool = Math.min(uncappedLoraPool, Math.floor(basePoints * LORA_POOL_CAP_RATE));
+const pointsPerLoraShare = totalLoraShares > 0 ? Math.floor(loraRewardPool / totalLoraShares) : 0;
+
+// Distribute LoRA rewards proportionally
+for (const [ownerId, shares] of Object.entries(loraShares)) {
+  const points = pointsPerLoraShare * shares;
+  if (points > 0) rewardsToDistribute.push({ contributorId: ownerId, points });
+}
+
+// Distribute spell reward
+if (spellRewardPoints > 0) {
+  rewardsToDistribute.push({ contributorId: spellOwnerId, points: spellRewardPoints });
+}
+
+const totalRewards = rewardsToDistribute.reduce((sum, r) => sum + r.points, 0);
+const totalPointsToCharge = basePoints + totalRewards;
 ```
-
-The rest of the share-proportional division logic remains the same — `pointsPerShare = floor(pool / totalShares)`.
 
 ## Files Changed
 
@@ -171,6 +216,19 @@ The rest of the share-proportional division logic remains the same — `pointsPe
 | `src/core/services/store/lora/LoraService.js` | Already includes `ownerAccountId` in trigger map data |
 | `src/core/services/workflow/execution/StepExecutor.js` | Already passes `loraResolutionData` through correctly |
 | `src/core/services/workflow/execution/strategies/ImmediateStrategy.js` | Already includes `loraResolutionData` in metadata |
+
+## Delivery
+
+### Branch & PR
+
+- **Branch**: `fix/contributor-reward-distribution`
+- **PR target**: `main` on `lifehaverdev/noema`
+- All commits use [Conventional Commits](https://www.conventionalcommits.org/) with the `fix:` prefix so that release-please generates a **patch version bump** (e.g., 4.7.3 → 4.7.4)
+- Final commit message: `fix: enable contributor reward distribution for model trainers and spell authors`
+
+### Commit Strategy
+
+A single squash-style commit is preferred to keep the release-please changelog clean. If multiple commits are needed during development, the PR should be squash-merged with the `fix:` title.
 
 ## Testing Strategy
 
