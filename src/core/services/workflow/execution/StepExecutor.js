@@ -85,6 +85,27 @@ class StepExecutor {
             { internal: { client: this.internalApiClient } }
         );
 
+        // Pre-routing Seed Randomization — mirrors generationExecutionService.execute().
+        // Spell steps bypass that path entirely, so without this block every cast
+        // reuses whatever seed was baked into the step's parameterOverrides (or the
+        // tool's schema default) and produces deterministic output run after run.
+        // Normal tool execution treats undefined/null/empty/-1 as "auto"; do the same
+        // here so spells match that contract.
+        if (tool.service === 'comfyui') {
+            const seedKey = tool.metadata?.seedInputKey || 'input_seed';
+            const current = finalInputs[seedKey];
+            if (
+                current === undefined ||
+                current === null ||
+                current === '' ||
+                current === -1 ||
+                current === '-1'
+            ) {
+                finalInputs[seedKey] = Math.floor(Math.random() * 0xffffffff);
+                this.logger.debug(`[StepExecutor] Auto-assigned random ${seedKey}=${finalInputs[seedKey]} for spell '${spell.name}' step ${stepIndex + 1}`);
+            }
+        }
+
         // Get execution strategy (from tool definition or factory)
         const strategy = tool.executionStrategy || this.strategyFactory.createDefaultStrategy(tool);
 
