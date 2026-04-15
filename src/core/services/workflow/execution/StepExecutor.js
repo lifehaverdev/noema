@@ -85,24 +85,37 @@ class StepExecutor {
             { internal: { client: this.internalApiClient } }
         );
 
-        // Pre-routing Seed Randomization — mirrors generationExecutionService.execute().
-        // Spell steps bypass that path entirely, so without this block every cast
-        // reuses whatever seed was baked into the step's parameterOverrides (or the
-        // tool's schema default) and produces deterministic output run after run.
-        // Normal tool execution treats undefined/null/empty/-1 as "auto"; do the same
-        // here so spells match that contract.
+        // Pre-routing Seed Randomization — spell version.
+        //
+        // Normal tool execution (generationExecutionService.execute) randomizes
+        // input_seed when the *caller* leaves it undefined / null / '' / -1.
+        // For spells we can't just inspect the merged step input, because
+        // resolveStepInputs() stamps step.parameterOverrides on top — which
+        // means every cast reuses whatever seed was in the tool window at
+        // compose time and the result is deterministic.
+        //
+        // The rule we want is: "if the caster (the user casting the spell)
+        // did not explicitly provide a seed, randomize it — regardless of
+        // what was baked into the spell at compose time." A step can still
+        // pin its seed by wiring it through parameterMappings (e.g. piping
+        // another step's seed output), which we treat as an explicit
+        // reference and leave alone.
         if (tool.service === 'comfyui') {
             const seedKey = tool.metadata?.seedInputKey || 'input_seed';
-            const current = finalInputs[seedKey];
-            if (
-                current === undefined ||
-                current === null ||
-                current === '' ||
-                current === -1 ||
-                current === '-1'
-            ) {
+            const casterSeed = originalContext?.parameterOverrides?.[seedKey];
+            const casterProvidedSeed =
+                casterSeed !== undefined &&
+                casterSeed !== null &&
+                casterSeed !== '' &&
+                casterSeed !== -1 &&
+                casterSeed !== '-1';
+            const stepWiredSeed =
+                step.parameterMappings && step.parameterMappings[seedKey] &&
+                step.parameterMappings[seedKey].type === 'nodeOutput';
+
+            if (!casterProvidedSeed && !stepWiredSeed) {
                 finalInputs[seedKey] = Math.floor(Math.random() * 0xffffffff);
-                this.logger.debug(`[StepExecutor] Auto-assigned random ${seedKey}=${finalInputs[seedKey]} for spell '${spell.name}' step ${stepIndex + 1}`);
+                this.logger.debug(`[StepExecutor] Caster did not specify ${seedKey}; auto-assigned random ${finalInputs[seedKey]} for spell '${spell.name}' step ${stepIndex + 1}`);
             }
         }
 
